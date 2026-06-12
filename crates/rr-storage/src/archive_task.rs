@@ -22,7 +22,16 @@
 //!
 //! Any writer or database error is FATAL: the worker returns `Err`, and the
 //! CLI joins the thread and treats `Err` (or a thread panic) as
-//! process-fatal.
+//! process-fatal. Before returning that `Err`, the dying worker signals the
+//! shared shutdown watch so the supervisor drops BOTH archive senders. This
+//! closes a quiet-market hang: the supervisor only learns a receiver died on
+//! its next `send`, which may never come overnight, so without the signal the
+//! surviving archiver would block on `recv` forever and [`ArchiveHandles::join`]
+//! would never return.
+//!
+//! Lifetime contract: callers MUST [`ArchiveHandles::join`] the threads before
+//! the tokio runtime is dropped. The workers call `handle.block_on`, and a
+//! runtime dropped mid-`block_on` panics.
 
 use std::path::PathBuf;
 use std::thread::JoinHandle;
@@ -31,6 +40,7 @@ use std::time::Duration;
 use chrono::{TimeDelta, Utc};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::watch;
 
 use crate::db::Db;
 use crate::error::StorageError;
@@ -87,7 +97,17 @@ fn join_one(
 /// and `session_id` register finalized files; `handle` is the runtime the
 /// blocking threads drive their `recv`, timer, and database calls against
 /// (the CLI passes [`Handle::current`] from its multi-thread runtime).
+/// `shutdown` is the global shutdown watch: a worker that hits a fatal error
+/// sends `true` on it so the supervisor drops both senders.
+///
+/// Callers MUST [`ArchiveHandles::join`] before dropping the runtime: the
+/// workers `block_on` `handle`, and a runtime dropped mid-`block_on` panics.
 #[must_use]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the binding design contract fixes this spawner's parameters; each \
+              is distinct and required (two channels, runtime handle, shutdown)"
+)]
 pub fn spawn(
     data_dir: PathBuf,
     roll_interval: TimeDelta,
@@ -96,6 +116,7 @@ pub fn spawn(
     trades_rx: Receiver<<TradesDataset as Dataset>::Record>,
     candles_rx: Receiver<<CandlesDataset as Dataset>::Record>,
     handle: Handle,
+    shutdown: watch::Sender<bool>,
 ) -> ArchiveHandles {
     let trades = spawn_one::<TradesDataset>(
         data_dir.clone(),
@@ -104,9 +125,17 @@ pub fn spawn(
         session_id,
         trades_rx,
         handle.clone(),
+        shutdown.clone(),
     );
-    let candles =
-        spawn_one::<CandlesDataset>(data_dir, roll_interval, db, session_id, candles_rx, handle);
+    let candles = spawn_one::<CandlesDataset>(
+        data_dir,
+        roll_interval,
+        db,
+        session_id,
+        candles_rx,
+        handle,
+        shutdown,
+    );
     ArchiveHandles { trades, candles }
 }
 
@@ -118,13 +147,14 @@ fn spawn_one<D: Dataset>(
     session_id: i64,
     rx: Receiver<D::Record>,
     handle: Handle,
+    shutdown: watch::Sender<bool>,
 ) -> JoinHandle<Result<(), StorageError>>
 where
     D::Record: Send + 'static,
 {
     std::thread::spawn(move || {
         let writer = PartitionedWriter::<D>::new(data_dir, roll_interval);
-        run_archiver::<D>(writer, rx, db, session_id, handle)
+        run_archiver::<D>(writer, rx, db, session_id, handle, shutdown)
     })
 }
 
@@ -133,22 +163,49 @@ where
 /// Runs on a dedicated OS thread. Blocks on `handle` for the timed `recv`
 /// and for each `record_file` call. Returns `Ok(())` once the channel closes
 /// and `finalize_all` has flushed; any writer or database error returns
-/// `Err` (fatal) after logging the failing dataset.
+/// `Err` (fatal) after logging the failing dataset and signalling `shutdown`
+/// so the supervisor drops both senders (closing the quiet-market hang).
+///
+/// Callers MUST [`ArchiveHandles::join`] before dropping the runtime: this
+/// `block_on`s `handle`, and a runtime dropped mid-`block_on` panics.
 ///
 /// # Errors
 ///
 /// Returns [`StorageError`] on the first writer or database failure.
 #[expect(
     clippy::needless_pass_by_value,
-    reason = "the dedicated thread owns its Db pool ref and runtime Handle; \
-              both release when this returns and the thread exits"
+    reason = "thread entry point: it should own its resources for the thread's \
+              lifetime; ownership is the right semantic though the body only \
+              borrows, and Db/Handle are cheap (Arc-backed) to move"
 )]
 pub fn run_archiver<D: Dataset>(
-    mut writer: PartitionedWriter<D>,
-    mut rx: Receiver<D::Record>,
+    writer: PartitionedWriter<D>,
+    rx: Receiver<D::Record>,
     db: Db,
     session_id: i64,
     handle: Handle,
+    shutdown: watch::Sender<bool>,
+) -> Result<(), StorageError>
+where
+    D::Record: Send + 'static,
+{
+    let result = drive::<D>(writer, rx, &db, session_id, &handle);
+    if result.is_err() {
+        // Wake the supervisor so it drops both senders; otherwise the sibling
+        // archiver blocks on recv forever in a quiet market and join() hangs.
+        let _ = shutdown.send(true);
+    }
+    result
+}
+
+/// The archive drain loop. Split from [`run_archiver`] so the shutdown signal
+/// fires on any `Err` exit regardless of which step failed.
+fn drive<D: Dataset>(
+    mut writer: PartitionedWriter<D>,
+    mut rx: Receiver<D::Record>,
+    db: &Db,
+    session_id: i64,
+    handle: &Handle,
 ) -> Result<(), StorageError>
 where
     D::Record: Send + 'static,
@@ -160,12 +217,12 @@ where
             Ok(Some(record)) => fatal::<D, _>(writer.append(record, Utc::now()))?,
             Ok(None) => {
                 let files = fatal::<D, _>(writer.finalize_all())?;
-                record_files::<D>(&files, &db, session_id, &handle)?;
+                record_files::<D>(&files, db, session_id, handle)?;
                 return Ok(());
             }
             Err(_elapsed) => fatal::<D, _>(writer.roll_due(Utc::now()))?,
         };
-        record_files::<D>(&finalized, &db, session_id, &handle)?;
+        record_files::<D>(&finalized, db, session_id, handle)?;
     }
 }
 
@@ -203,7 +260,7 @@ mod tests {
     use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
     use rust_decimal::Decimal;
     use tokio::runtime::Handle;
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, watch};
 
     use crate::archive_task::spawn;
     use crate::db::Db;
@@ -258,6 +315,7 @@ mod tests {
 
         let (trades_tx, trades_rx) = mpsc::channel(16);
         let (candles_tx, candles_rx) = mpsc::channel(16);
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let handles = spawn(
             tmp.path().to_path_buf(),
             ROLL,
@@ -266,6 +324,7 @@ mod tests {
             trades_rx,
             candles_rx,
             Handle::current(),
+            shutdown_tx,
         );
 
         for id in 0..10 {
@@ -317,6 +376,7 @@ mod tests {
 
         let (trades_tx, trades_rx) = mpsc::channel(16);
         let (candles_tx, candles_rx) = mpsc::channel(16);
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         // Zero roll interval: any open file is due on the first timeout tick.
         let handles = spawn(
             tmp.path().to_path_buf(),
@@ -326,15 +386,14 @@ mod tests {
             trades_rx,
             candles_rx,
             Handle::current(),
+            shutdown_tx,
         );
 
         trades_tx.send(trade("1")?).await?;
-        // Wait past one ~1s recv timeout so roll_due finalizes the open file
-        // without dropping the sender.
-        tokio::time::sleep(Duration::from_millis(1200)).await;
-
+        // Poll until the timeout-tick roll_due registers the idle file, rather
+        // than racing a fixed sleep against the ~1s tick + record_file latency.
         let date = NaiveDate::from_str(PARTITION_DATE)?;
-        let files = db.files_for_date(date).await?;
+        let files = poll_files(&db, date, 1).await?;
         assert_eq!(files.len(), 1, "idle file should roll before shutdown");
         assert_eq!(files[0].rows, 1);
 
@@ -357,6 +416,7 @@ mod tests {
 
         let (trades_tx, trades_rx) = mpsc::channel(16);
         let (candles_tx, candles_rx) = mpsc::channel(16);
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let handles = spawn(
             tmp.path().to_path_buf(),
             ROLL,
@@ -365,6 +425,7 @@ mod tests {
             trades_rx,
             candles_rx,
             Handle::current(),
+            shutdown_tx,
         );
 
         // 19 fractional digits: rejected by TradesDataset::validate at append.
@@ -382,5 +443,75 @@ mod tests {
             other => panic!("expected DecimalPrecision, got {other:?}"),
         }
         Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[expect(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        reason = "test assertions; Result is for `?`"
+    )]
+    async fn dying_writer_signals_shutdown_so_join_does_not_hang() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let db = open_db(&tmp).await?;
+        let session = db.start_session("{}").await?;
+
+        let (trades_tx, trades_rx) = mpsc::channel(16);
+        // Candles sender stays alive: this models a quiet market where the
+        // supervisor never sends and so never notices a dead receiver.
+        let (candles_tx, candles_rx) = mpsc::channel(16);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let handles = spawn(
+            tmp.path().to_path_buf(),
+            ROLL,
+            db.clone(),
+            session,
+            trades_rx,
+            candles_rx,
+            Handle::current(),
+            shutdown_tx,
+        );
+
+        let mut bad = trade("1")?;
+        bad.price = Decimal::from_str("0.0000000000000000001")?;
+        trades_tx.send(bad).await?;
+        drop(trades_tx);
+
+        // The dying trades thread must signal shutdown. In production the
+        // supervisor reacts by dropping the candles sender; here we wait for
+        // the signal, then drop it ourselves to let the candles thread finish.
+        shutdown_rx.changed().await?;
+        assert!(*shutdown_rx.borrow(), "dying writer should signal shutdown");
+        drop(candles_tx);
+
+        let result = tokio::task::spawn_blocking(move || handles.join()).await?;
+        match result {
+            Err(crate::error::StorageError::DecimalPrecision { scale, .. }) => {
+                assert_eq!(scale, 19);
+            }
+            other => panic!("expected DecimalPrecision, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Polls `files_for_date` every ~50ms up to a 5s deadline, returning as
+    /// soon as at least `want` files are registered. Event-driven, so it is
+    /// not sensitive to the archiver's tick/record latency.
+    async fn poll_files(
+        db: &Db,
+        date: NaiveDate,
+        want: usize,
+    ) -> Result<Vec<crate::db::ArchiveFileRow>, Box<dyn Error>> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let files = db.files_for_date(date).await?;
+            if files.len() >= want {
+                return Ok(files);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("timed out waiting for {want} archive file(s)").into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
