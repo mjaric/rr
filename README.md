@@ -3,8 +3,9 @@
 A crypto trading agent that trades conservatively and by plan — proven in simulation
 on real market data before any real money is involved.
 
-**Status: M0 done; M1 (market data) is next.** Milestones are designed, planned,
-and implemented one at a time — see the roadmap below.
+**Status: M0 done; M1 (market data ingestion) implemented, in review.** The overnight
+gap-free verification is the remaining gate before M1 is marked done. Milestones are
+designed, planned, and implemented one at a time — see the roadmap below.
 
 ## What it does (when built)
 
@@ -33,7 +34,7 @@ and implemented one at a time — see the roadmap below.
 | Milestone | Scope | Status |
 |-----------|-------|--------|
 | M0 | Skeleton & guardrails (workspace, lints, CI, hooks) | done |
-| M1 | Market data ingestion & archiving (Binance, Coinbase → Parquet/SQLite) | pending |
+| M1 | Market data ingestion & archiving (Binance, Coinbase → Parquet/SQLite) | in review |
 | M2 | Simulation engine + first strategy + risk limits | pending |
 | M3 | Web dashboard v1 | pending |
 | M4 | Backtesting + second strategy + regime filter | pending |
