@@ -3,8 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use chrono::TimeDelta;
-use chrono::{NaiveDate, Utc};
+use chrono::{NaiveDate, TimeDelta, Utc};
 use clap::{Parser, Subcommand};
 use rr_engine::market_data::supervisor::ArchiveSenders;
 use rr_engine::market_data::{spec, supervisor};
@@ -81,7 +80,7 @@ async fn run_archive_status(data_dir: &Path, date: NaiveDate) -> anyhow::Result<
 }
 
 /// Writes the rendered report to stdout. This is the only stdout write in the
-/// binary; the M0 rr-cli boundary keeps it isolated to one function.
+/// binary; all other output goes through `tracing` to stderr.
 #[expect(
     clippy::print_stdout,
     reason = "archive-status is a user-facing report; stdout is its output"
@@ -292,6 +291,19 @@ mod tests {
         }
     }
 
+    /// Like [`coverage`] but with a caller-chosen `trade_rows`, so two rows can
+    /// differ in the TRADES column width and exercise column alignment.
+    fn coverage_with_trades(
+        trade_rows: u64,
+        minutes_present: u64,
+        minutes_gap: u64,
+    ) -> PairCoverage {
+        PairCoverage {
+            trade_rows,
+            ..coverage(minutes_present, minutes_gap)
+        }
+    }
+
     fn date() -> NaiveDate {
         #[expect(clippy::unwrap_used, reason = "literal test date is statically valid")]
         NaiveDate::from_ymd_opt(2026, 6, 12).unwrap()
@@ -335,7 +347,12 @@ mod tests {
 
     #[test]
     fn render_aligns_columns_with_varied_widths() {
-        let rows = [coverage(1440, 0), coverage(1437, 3)];
+        // Rows differ in the TRADES column width (8 digits vs 1), which sits
+        // left of COVERAGE; ragged columns would shift COVERAGE's offset.
+        let rows = [
+            coverage_with_trades(12_345_678, 1440, 0),
+            coverage_with_trades(1, 1437, 3),
+        ];
         let out = render_status(date(), &rows);
         let header = out
             .lines()
@@ -345,15 +362,12 @@ mod tests {
             .lines()
             .find(|l| l.contains("GAPS:3"))
             .unwrap_or_default();
+        let header_offset = header.find("COVERAGE");
+        let data_offset = data.find("1437/1440");
+        assert!(header_offset.is_some(), "header missing COVERAGE: {out}");
         assert_eq!(
-            header.split_whitespace().count(),
-            10,
-            "header token count: {out}"
-        );
-        assert_eq!(
-            data.split_whitespace().count(),
-            10,
-            "data token count: {out}"
+            header_offset, data_offset,
+            "COVERAGE column misaligned: {out}"
         );
     }
 
