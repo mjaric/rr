@@ -13,6 +13,28 @@ pub enum Side {
     Sell,
 }
 
+impl Side {
+    /// Canonical string encoding for archives and reports: `"buy"` / `"sell"`.
+    /// Every consumer uses this — never invent another encoding.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Side::Buy => "buy",
+            Side::Sell => "sell",
+        }
+    }
+
+    /// Parses the canonical encoding produced by [`Side::as_str`].
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Side> {
+        match s {
+            "buy" => Some(Side::Buy),
+            "sell" => Some(Side::Sell),
+            _ => None,
+        }
+    }
+}
+
 /// A single public trade as persisted to the market-data archive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TradeRecord {
@@ -100,6 +122,16 @@ mod tests {
         };
         assert_eq!(trade.partition_date().to_string(), "2026-06-12");
         Ok(())
+    }
+
+    #[test]
+    fn side_canonical_encoding_round_trips() {
+        assert_eq!(Side::Buy.as_str(), "buy");
+        assert_eq!(Side::Sell.as_str(), "sell");
+        assert_eq!(Side::parse("buy"), Some(Side::Buy));
+        assert_eq!(Side::parse("sell"), Some(Side::Sell));
+        assert_eq!(Side::parse("BUY"), None);
+        assert_eq!(Side::parse(""), None);
     }
 
     #[test]
