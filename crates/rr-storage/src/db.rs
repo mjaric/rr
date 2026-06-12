@@ -114,6 +114,19 @@ pub struct ArchiveFileRow {
     pub closed_at: DateTime<Utc>,
 }
 
+/// One stream session with `ended_at` NULL, plus the neighbouring activity
+/// bounds the coverage report needs to derive process-dead intervals
+/// (see [`crate::status`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnendedSession {
+    /// When the session started.
+    pub(crate) started_at: DateTime<Utc>,
+    /// Timestamp of the session's last recorded event, if any.
+    pub(crate) last_event_ts: Option<DateTime<Utc>>,
+    /// `started_at` of the next session (any state), if one exists.
+    pub(crate) next_session_start: Option<DateTime<Utc>>,
+}
+
 /// Handle to the operational `SQLite` database; see the module docs for
 /// connection and encoding invariants.
 pub struct Db {
@@ -301,6 +314,86 @@ impl Db {
         }
         Ok(files)
     }
+
+    /// Latest `connected`/`disconnected` event kind per exchange with
+    /// `ts` strictly before `at` — the carry-in connection state for a
+    /// coverage day. Exchanges with no connection event before `at` are
+    /// absent. Ties on `ts` resolve by row id; ids are assigned in
+    /// insertion order and connection events are recorded as they happen,
+    /// so the greatest id at the latest `ts` is the most recent event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Sqlx`] if the query fails, or
+    /// [`StorageError::UnknownEventKind`] for an unrecognized `kind`.
+    pub(crate) async fn connection_states_before(
+        &self,
+        at: DateTime<Utc>,
+    ) -> Result<Vec<(String, EventKind)>, StorageError> {
+        let connected = EventKind::Connected.as_str();
+        let disconnected = EventKind::Disconnected.as_str();
+        let rows = sqlx::query(
+            "SELECT e.exchange, e.kind FROM stream_events e \
+             WHERE e.kind IN (?, ?) AND e.exchange IS NOT NULL AND e.ts < ? \
+               AND e.id = (SELECT MAX(i.id) FROM stream_events i \
+                           WHERE i.exchange = e.exchange \
+                             AND i.kind IN (?, ?) AND i.ts < ? \
+                             AND i.ts = (SELECT MAX(l.ts) FROM stream_events l \
+                                         WHERE l.exchange = e.exchange \
+                                           AND l.kind IN (?, ?) AND l.ts < ?)) \
+             ORDER BY e.exchange",
+        )
+        .bind(connected)
+        .bind(disconnected)
+        .bind(at)
+        .bind(connected)
+        .bind(disconnected)
+        .bind(at)
+        .bind(connected)
+        .bind(disconnected)
+        .bind(at)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(op_err("query connection states before"))?;
+        let mut states = Vec::with_capacity(rows.len());
+        for row in rows {
+            let kind: String = col(&row, "kind")?;
+            let kind = EventKind::parse(&kind).ok_or(StorageError::UnknownEventKind { kind })?;
+            states.push((col(&row, "exchange")?, kind));
+        }
+        Ok(states)
+    }
+
+    /// Every session with `ended_at` NULL, ascending by start, with the
+    /// timestamp of its last recorded event and the start of the next
+    /// session (sessions are inserted with `started_at = now`, so id order
+    /// is start order).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Sqlx`] if the query fails.
+    pub(crate) async fn unended_sessions(&self) -> Result<Vec<UnendedSession>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT s.started_at, \
+             (SELECT MAX(e.ts) FROM stream_events e WHERE e.session_id = s.id) \
+                 AS last_event_ts, \
+             (SELECT MIN(n.started_at) FROM stream_sessions n WHERE n.id > s.id) \
+                 AS next_session_start \
+             FROM stream_sessions s WHERE s.ended_at IS NULL ORDER BY s.id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(op_err("query unended sessions"))?;
+        let mut sessions = Vec::with_capacity(rows.len());
+        for row in rows {
+            sessions.push(UnendedSession {
+                started_at: col(&row, "started_at")?,
+                last_event_ts: col(&row, "last_event_ts")?,
+                next_session_start: col(&row, "next_session_start")?,
+            });
+        }
+        Ok(sessions)
+    }
 }
 
 /// Half-open UTC day range `[date 00:00Z, date+1 00:00Z)` for TEXT range
@@ -365,7 +458,7 @@ mod tests {
     use chrono::{DateTime, NaiveDate, Utc};
     use sqlx::Row;
 
-    use crate::db::{ArchiveFileRow, Db, EventKind, StreamEvent};
+    use crate::db::{ArchiveFileRow, Db, EventKind, StreamEvent, UnendedSession};
     use crate::error::StorageError;
     use crate::parquet::FinalizedFile;
 
@@ -681,6 +774,123 @@ mod tests {
             .files_for_date("2026-06-14".parse::<NaiveDate>()?)
             .await?;
         assert!(empty.is_empty());
+        Ok(())
+    }
+
+    async fn session_start(db: &Db, id: i64) -> Result<DateTime<Utc>, sqlx::Error> {
+        let row = sqlx::query("SELECT started_at FROM stream_sessions WHERE id = ?")
+            .bind(id)
+            .fetch_one(&db.pool)
+            .await?;
+        row.try_get("started_at")
+    }
+
+    #[expect(clippy::unwrap_used, reason = "test helper; inputs are literals")]
+    fn connection_event(ts: &str, exchange: Option<&str>, kind: EventKind) -> StreamEvent {
+        StreamEvent {
+            ts: ts.parse::<DateTime<Utc>>().unwrap(),
+            exchange: exchange.map(str::to_owned),
+            pair: None,
+            kind,
+            details: None,
+        }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "test assertions; Result is for `?`"
+    )]
+    async fn connection_states_before_returns_latest_kind_per_exchange() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let db = open_db(&tmp).await?;
+        let session = db.start_session("{}").await?;
+
+        let events = [
+            connection_event(
+                "2026-06-09T08:00:00Z",
+                Some("binance_spot"),
+                EventKind::Connected,
+            ),
+            connection_event(
+                "2026-06-09T09:00:00Z",
+                Some("binance_spot"),
+                EventKind::Disconnected,
+            ),
+            connection_event(
+                "2026-06-09T09:30:00Z",
+                Some("coinbase"),
+                EventKind::Connected,
+            ),
+            // Non-connection kinds and exchange-less events never count.
+            connection_event(
+                "2026-06-09T09:45:00Z",
+                Some("binance_spot"),
+                EventKind::GapDetected,
+            ),
+            connection_event("2026-06-09T09:50:00Z", None, EventKind::Connected),
+            // At/after the cutoff: excluded (strict `<`).
+            connection_event("2026-06-10T00:00:00Z", Some("kraken"), EventKind::Connected),
+        ];
+        for ev in &events {
+            db.record_event(session, ev).await?;
+        }
+
+        let cutoff = "2026-06-10T00:00:00Z".parse::<DateTime<Utc>>()?;
+        assert_eq!(
+            db.connection_states_before(cutoff).await?,
+            vec![
+                ("binance_spot".to_owned(), EventKind::Disconnected),
+                ("coinbase".to_owned(), EventKind::Connected),
+            ]
+        );
+        assert!(
+            db.connection_states_before("2026-06-09T08:00:00Z".parse::<DateTime<Utc>>()?)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "test assertions; Result is for `?`"
+    )]
+    async fn unended_sessions_report_activity_bounds() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let db = open_db(&tmp).await?;
+
+        let ended = db.start_session("{}").await?;
+        db.end_session(ended).await?;
+        let with_events = db.start_session("{}").await?;
+        let without_events = db.start_session("{}").await?;
+
+        // Out of ts order on purpose: last_event_ts is the max ts, not the
+        // last insert.
+        let late = event("2026-06-10T11:30:00Z", EventKind::GapDetected)?;
+        let early = event("2026-06-10T10:00:00Z", EventKind::Connected)?;
+        db.record_event(with_events, &late).await?;
+        db.record_event(with_events, &early).await?;
+
+        let second_start = session_start(&db, with_events).await?;
+        let third_start = session_start(&db, without_events).await?;
+
+        assert_eq!(
+            db.unended_sessions().await?,
+            vec![
+                UnendedSession {
+                    started_at: second_start,
+                    last_event_ts: Some(late.ts),
+                    next_session_start: Some(third_start),
+                },
+                UnendedSession {
+                    started_at: third_start,
+                    last_event_ts: None,
+                    next_session_start: None,
+                },
+            ]
+        );
         Ok(())
     }
 }

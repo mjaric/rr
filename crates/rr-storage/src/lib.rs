@@ -4,3 +4,4 @@ pub mod db;
 pub mod error;
 pub mod parquet;
 pub mod records;
+pub mod status;
