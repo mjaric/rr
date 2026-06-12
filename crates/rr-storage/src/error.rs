@@ -81,4 +81,11 @@ pub enum StorageError {
         /// The offending date, unmodified.
         date: NaiveDate,
     },
+    /// An archive writer thread panicked; its join surfaced no `StorageError`
+    /// but the thread did not finish normally. Treated as process-fatal.
+    #[error("archive writer thread for {dataset} dataset panicked")]
+    ArchiveThreadPanicked {
+        /// Dataset whose thread panicked (`trades` / `candles`).
+        dataset: &'static str,
+    },
 }
