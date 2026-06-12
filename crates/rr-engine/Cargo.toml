@@ -4,5 +4,21 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[dependencies]
+barter-data = { workspace = true }
+barter-instrument = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+rr-storage = { path = "../rr-storage" }
+rust_decimal = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
+
 [lints]
 workspace = true

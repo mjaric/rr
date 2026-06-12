@@ -9,10 +9,18 @@ name = "rr"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
 clap = { workspace = true }
+rr-engine = { path = "../rr-engine" }
+rr-storage = { path = "../rr-storage" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
