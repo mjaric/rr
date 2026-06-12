@@ -24,13 +24,32 @@ pub enum IngestOutcome {
     Late,
 }
 
+/// Per-key aggregation state: open windows plus the late-trade cutoff.
+///
+/// Holding both in one value makes the invariant structural: every open
+/// window start is strictly greater than `emitted_through`.
+#[derive(Debug, Default)]
+struct KeyState {
+    /// Open windows: window start → building candle.
+    windows: BTreeMap<DateTime<Utc>, CandleRecord>,
+    /// Highest emitted window start; any window at or before it is late.
+    emitted_through: Option<DateTime<Utc>>,
+}
+
+impl KeyState {
+    /// Records that this key's windows are emitted up to and including `start`.
+    fn advance(&mut self, start: DateTime<Utc>) {
+        if self.emitted_through.is_none_or(|through| through < start) {
+            self.emitted_through = Some(start);
+        }
+    }
+}
+
 /// Per-key stream-order candle builder over tumbling 1-minute UTC windows.
 #[derive(Debug, Default)]
 pub struct CandleAggregator {
-    /// Open windows keyed by (exchange, pair) → (window start → building candle).
-    open: BTreeMap<Key, BTreeMap<DateTime<Utc>, CandleRecord>>,
-    /// Highest emitted window start per key; any window at or before it is late.
-    emitted_through: BTreeMap<Key, DateTime<Utc>>,
+    /// Aggregation state per (exchange, pair).
+    keys: BTreeMap<Key, KeyState>,
 }
 
 impl CandleAggregator {
@@ -42,19 +61,22 @@ impl CandleAggregator {
     pub fn ingest(&mut self, trade: &TradeRecord) -> (Vec<CandleRecord>, IngestOutcome) {
         let window = window_start(trade.ts_exchange);
         let key: Key = (trade.exchange.clone(), trade.pair.clone());
-        if self.emitted_through.get(&key).is_some_and(|t| window <= *t) {
+        let state = self.keys.entry(key).or_default();
+        if state
+            .emitted_through
+            .is_some_and(|through| window <= through)
+        {
             return (Vec::new(), IngestOutcome::Late);
         }
 
-        let windows = self.open.entry(key.clone()).or_default();
-        fold(windows, window, trade);
+        fold(&mut state.windows, window, trade);
 
         // The trade proves every strictly older open window of this key complete.
-        let still_open = windows.split_off(&window);
-        let completed = std::mem::replace(windows, still_open);
+        let still_open = state.windows.split_off(&window);
+        let completed = std::mem::replace(&mut state.windows, still_open);
         let mut emitted = Vec::with_capacity(completed.len());
         for (start, candle) in completed {
-            advance(&mut self.emitted_through, &key, start);
+            state.advance(start);
             emitted.push(candle);
         }
         (emitted, IngestOutcome::Ok)
@@ -71,23 +93,25 @@ impl CandleAggregator {
         self.flush_if(|_| true)
     }
 
+    /// `due` must be prefix-closed over ascending window starts (once false,
+    /// false for every later start): each key's scan stops at the first miss.
     fn flush_if(&mut self, due: impl Fn(DateTime<Utc>) -> bool) -> Vec<CandleRecord> {
         let mut emitted = Vec::new();
-        for (key, windows) in &mut self.open {
-            let starts: Vec<DateTime<Utc>> = windows
+        for state in self.keys.values_mut() {
+            let starts: Vec<DateTime<Utc>> = state
+                .windows
                 .keys()
                 .take_while(|start| due(**start))
                 .copied()
                 .collect();
             for start in starts {
-                let Some(candle) = windows.remove(&start) else {
+                let Some(candle) = state.windows.remove(&start) else {
                     continue;
                 };
-                advance(&mut self.emitted_through, key, start);
+                state.advance(start);
                 emitted.push(candle);
             }
         }
-        self.open.retain(|_, windows| !windows.is_empty());
         emitted.sort_by_key(|candle| candle.ts_open);
         emitted
     }
@@ -121,14 +145,6 @@ fn fold(
                 trade_count: 1,
             },
         );
-    }
-}
-
-/// Records that the key's windows are emitted up to and including `start`.
-fn advance(emitted_through: &mut BTreeMap<Key, DateTime<Utc>>, key: &Key, start: DateTime<Utc>) {
-    let through = emitted_through.entry(key.clone()).or_insert(start);
-    if *through < start {
-        *through = start;
     }
 }
 
@@ -407,6 +423,54 @@ mod tests {
         assert_eq!(candles[0].ts_open.to_rfc3339(), "2026-06-12T10:00:00+00:00");
         assert_eq!(candles[1].ts_open.to_rfc3339(), "2026-06-12T10:00:00+00:00");
         assert_eq!(candles[2].ts_open.to_rfc3339(), "2026-06-12T10:01:00+00:00");
+    }
+
+    #[test]
+    fn one_flush_emits_due_windows_from_several_keys_sorted_by_ts_open() {
+        let mut agg = CandleAggregator::default();
+        // Newest-first per key so every window stays open until the flush.
+        // Per-key iteration order alone would yield 10:00, 10:02, 10:01, 10:00.
+        agg.ingest(&trade("BTC-USDT", "2026-06-12T10:02:10Z", "102", "1"));
+        agg.ingest(&trade("BTC-USDT", "2026-06-12T10:00:10Z", "100", "1"));
+        agg.ingest(&trade("ETH-USDT", "2026-06-12T10:01:10Z", "11", "1"));
+        agg.ingest(&trade_on(
+            "coinbase",
+            "BTC-USDT",
+            "2026-06-12T10:00:20Z",
+            "99",
+            "1",
+        ));
+
+        let emitted = agg.flush_older_than(ts("2026-06-12T10:03:00Z"));
+        let order: Vec<(String, String, String)> = emitted
+            .iter()
+            .map(|c| (c.ts_open.to_rfc3339(), c.exchange.clone(), c.pair.clone()))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (
+                    "2026-06-12T10:00:00+00:00".to_owned(),
+                    "binance_spot".to_owned(),
+                    "BTC-USDT".to_owned()
+                ),
+                (
+                    "2026-06-12T10:00:00+00:00".to_owned(),
+                    "coinbase".to_owned(),
+                    "BTC-USDT".to_owned()
+                ),
+                (
+                    "2026-06-12T10:01:00+00:00".to_owned(),
+                    "binance_spot".to_owned(),
+                    "ETH-USDT".to_owned()
+                ),
+                (
+                    "2026-06-12T10:02:00+00:00".to_owned(),
+                    "binance_spot".to_owned(),
+                    "BTC-USDT".to_owned()
+                ),
+            ]
+        );
     }
 
     mod props {
