@@ -335,22 +335,15 @@ impl Db {
         let connected = EventKind::Connected.as_str();
         let disconnected = EventKind::Disconnected.as_str();
         let rows = sqlx::query(
-            "SELECT e.exchange, e.kind FROM stream_events e \
-             WHERE e.kind IN (?, ?) AND e.exchange IS NOT NULL AND e.ts < ? \
-               AND e.id = (SELECT MAX(i.id) FROM stream_events i \
-                           WHERE i.exchange = e.exchange \
-                             AND i.kind IN (?, ?) AND i.ts < ? \
-                             AND i.ts = (SELECT MAX(l.ts) FROM stream_events l \
-                                         WHERE l.exchange = e.exchange \
-                                           AND l.kind IN (?, ?) AND l.ts < ?)) \
-             ORDER BY e.exchange",
+            "SELECT exchange, kind FROM (\
+                 SELECT exchange, kind, \
+                        ROW_NUMBER() OVER (PARTITION BY exchange \
+                                           ORDER BY ts DESC, id DESC) AS rn \
+                 FROM stream_events \
+                 WHERE kind IN (?, ?) AND exchange IS NOT NULL AND ts < ?\
+             ) ranked \
+             WHERE rn = 1 ORDER BY exchange",
         )
-        .bind(connected)
-        .bind(disconnected)
-        .bind(at)
-        .bind(connected)
-        .bind(disconnected)
-        .bind(at)
         .bind(connected)
         .bind(disconnected)
         .bind(at)
@@ -893,6 +886,68 @@ mod tests {
                 },
             ]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        reason = "test assertions; Result is for `?`"
+    )]
+    async fn record_file_rejects_row_count_above_i64_max() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let db = open_db(&tmp).await?;
+        let session = db.start_session("{}").await?;
+
+        let mut huge = finalized_file("2026-06-12")?;
+        huge.rows = u64::MAX;
+        match db.record_file(session, &huge).await {
+            Err(StorageError::RowCountOverflow { rows }) => assert_eq!(rows, u64::MAX),
+            other => panic!("expected RowCountOverflow, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        reason = "test assertions; Result is for `?`"
+    )]
+    async fn events_for_date_rejects_date_with_no_successor() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let db = open_db(&tmp).await?;
+
+        match db.events_for_date(NaiveDate::MAX).await {
+            Err(StorageError::DateOutOfRange { date }) => assert_eq!(date, NaiveDate::MAX),
+            other => panic!("expected DateOutOfRange, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[expect(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        reason = "test assertions; Result is for `?`"
+    )]
+    async fn record_file_rejects_non_utf8_path() -> TestResult {
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir()?;
+        let db = open_db(&tmp).await?;
+        let session = db.start_session("{}").await?;
+
+        let bad_path =
+            std::path::Path::new(std::ffi::OsStr::from_bytes(b"/tmp/\xff")).to_path_buf();
+        let mut file = finalized_file("2026-06-12")?;
+        file.path = bad_path.clone();
+        match db.record_file(session, &file).await {
+            Err(StorageError::NonUtf8Path { path }) => assert_eq!(path, bad_path),
+            other => panic!("expected NonUtf8Path, got {other:?}"),
+        }
         Ok(())
     }
 }

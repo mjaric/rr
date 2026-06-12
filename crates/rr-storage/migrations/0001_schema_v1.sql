@@ -7,6 +7,11 @@
 --
 -- "rows" is double-quoted because ROWS is a reserved word in standard SQL
 -- (and PostgreSQL, the upgrade path); SQLite accepts the quoted form too.
+--
+-- `INTEGER PRIMARY KEY AUTOINCREMENT` is the single deliberate SQLite-specific
+-- construct here. The PostgreSQL upgrade path uses its own identity/serial
+-- columns for these surrogate keys; migrations are per-database anyway, so this
+-- file is never replayed against Postgres. Every other construct is portable.
 
 CREATE TABLE stream_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
