@@ -57,9 +57,18 @@ pub async fn build_stream() -> Result<
     impl Stream<Item = MarketStreamResult<MarketDataInstrument, PublicTrade>> + Unpin,
     EngineError,
 > {
+    let binance = subscriptions(BinanceSpot::default(), "binance_spot");
+    let coinbase = subscriptions(Coinbase, "coinbase");
+    // Guards against an exchange id in PAIRS that no `subscriptions` call
+    // matches (a silent drift would yield an empty subscription set).
+    debug_assert_eq!(
+        binance.len() + coinbase.len(),
+        PAIRS.len(),
+        "subscription exchange ids must match PAIRS exchange strings"
+    );
     let streams = Streams::<PublicTrades>::builder()
-        .subscribe(subscriptions(BinanceSpot::default(), "binance_spot"))
-        .subscribe(subscriptions(Coinbase, "coinbase"))
+        .subscribe(binance)
+        .subscribe(coinbase)
         .init()
         .await?;
     Ok(streams.select_all())
@@ -200,6 +209,11 @@ impl Supervisor {
 
     /// A connection dropped; barter emits no explicit "reconnected" event,
     /// so mark the exchange and close the interval on its next item.
+    ///
+    /// Repeated `Reconnecting` for the same exchange before any item records
+    /// `Disconnected` more than once; coverage reporting
+    /// (`rr_storage::status::disconnected_intervals`) folds consecutive
+    /// down-transitions, so the duplicates are harmless.
     async fn on_reconnecting(&mut self, exchange: &str) -> Result<(), EngineError> {
         tracing::warn!(exchange, "market stream disconnected; reconnecting");
         self.reconnecting.insert(exchange.to_owned());
@@ -230,7 +244,7 @@ impl Supervisor {
             self.record(EventKind::Connected, Some(exchange.to_owned()), None, None)
                 .await?;
         }
-        let record = match to_trade_record(event) {
+        let record = match to_trade_record(event, Utc::now()) {
             Ok(record) => record,
             Err(error) => return self.on_bad_trade(event, &error).await,
         };
@@ -779,6 +793,23 @@ mod tests {
             panic!("expected an Error event, got {events:?}");
         };
         assert_eq!(error.details.as_deref(), Some("stream ended"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        reason = "test assertions; Result is for `?`"
+    )]
+    async fn dead_trade_channel_is_fatal() -> TestResult {
+        let h = spawn(vec![trade("1", "2026-06-12T10:00:01Z")]).await?;
+        // Drop the trade receiver so the supervisor's send fails.
+        drop(h.trades_rx);
+        match h.handle.await? {
+            Err(EngineError::ArchiveChannelClosed { dataset: "trades" }) => {}
+            other => panic!("expected ArchiveChannelClosed trades, got {other:?}"),
+        }
         Ok(())
     }
 
