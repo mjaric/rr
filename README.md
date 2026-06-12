@@ -31,7 +31,7 @@ on real market data before any real money is involved.
 
 | Milestone | Scope | Status |
 |-----------|-------|--------|
-| M0 | Skeleton & guardrails (workspace, lints, CI, hooks) | designing |
+| M0 | Skeleton & guardrails (workspace, lints, CI, hooks) | in review |
 | M1 | Market data ingestion & archiving (Binance, Coinbase → Parquet/SQLite) | pending |
 | M2 | Simulation engine + first strategy + risk limits | pending |
 | M3 | Web dashboard v1 | pending |
@@ -54,8 +54,19 @@ Rust (Cargo workspace: engine on [barter-rs](https://github.com/barter-rs/barter
 Axum server, Leptos/WASM dashboard) · Python via `uv` for analytics/ML ·
 SQLite (sqlx) + Parquet for storage · Claude API for analysis reports.
 
+## Development
+
+```sh
+git clone https://github.com/mjaric/rr.git && cd rr
+prek install                  # git hooks (fmt, clippy, ruff, actionlint)
+cargo build --workspace       # Rust workspace
+cd analytics && uv sync       # Python analytics environment
+```
+
 ## Disclaimer
 
 This is a personal research and learning project. Nothing here is financial advice.
 Crypto trading carries a real risk of loss; that is exactly why this project trades
 simulated money until proven otherwise.
+
+Copyright © 2026 Milan Jaric. All rights reserved. Proprietary — no license granted.

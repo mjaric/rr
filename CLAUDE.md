@@ -49,6 +49,10 @@ implemented change makes it stale.
   exception is the CDN-loaded `lightweight-charts` library.
 - Rust style, lints, and quality gates follow the global standards (clippy pedantic
   + deny unwrap/panic/todo, zero warnings, `prek run` before commit).
+- Lints stay strict everywhere, tests included. A test that must panic/unwrap/expect
+  carries a narrow `#[expect(lint, reason = "...")]` on the test fn — never `#[allow]`.
+- `rr-kraken` depends only on barter-data, never on other `rr-*` crates — it is
+  planned for separate open-sourcing.
 
 ## Domain guardrails for agents
 
