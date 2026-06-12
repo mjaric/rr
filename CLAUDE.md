@@ -38,8 +38,9 @@ implemented change makes it stale.
 
 ## Repository conventions
 
-- Cargo workspace under `crates/`: `rr-engine`, `rr-kraken`, `rr-storage`,
-  `rr-server`, `rr-dashboard`. Python analytics under `analytics/` (uv/ruff/ty).
+- Cargo workspace under `crates/`: `rr-cli` (the `rr` binary), `rr-engine`,
+  `rr-kraken`, `rr-storage`, `rr-server`, `rr-dashboard`. Python analytics under
+  `analytics/` (uv/ruff/ty).
 - Storage: SQLite via sqlx (WAL) for operational state; Parquet for market-data
   history (partitioned by exchange/pair/day). Keep SQL portable — Postgres is the
   upgrade path.

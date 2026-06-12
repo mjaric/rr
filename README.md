@@ -3,7 +3,8 @@
 A crypto trading agent that trades conservatively and by plan — proven in simulation
 on real market data before any real money is involved.
 
-**Status: design phase.** No implementation yet; we are writing per-milestone designs.
+**Status: M0 (skeleton & guardrails) in review.** Milestones are designed, planned,
+and implemented one at a time — see the roadmap below.
 
 ## What it does (when built)
 
@@ -59,6 +60,7 @@ SQLite (sqlx) + Parquet for storage · Claude API for analysis reports.
 ```sh
 git clone https://github.com/mjaric/rr.git && cd rr
 prek install                  # git hooks (fmt, clippy, ruff, actionlint)
+prek auto-update --cooldown-days 7   # keep hook versions fresh, 7-day cooldown
 cargo build --workspace       # Rust workspace
 cd analytics && uv sync       # Python analytics environment
 ```
