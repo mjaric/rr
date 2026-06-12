@@ -12,6 +12,7 @@ anyhow = "1.0.102"
 arrow = "59.0.0"
 assert_cmd = "2.2.2"
 barter-data = "0.11.0"
+barter-instrument = "0.3.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive"] }
 futures = "0.3.32"

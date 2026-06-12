@@ -2453,11 +2453,14 @@ name = "rr-engine"
 version = "0.1.0"
 dependencies = [
  "barter-data",
+ "barter-instrument",
  "chrono",
  "futures",
  "proptest",
  "rr-storage",
  "rust_decimal",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

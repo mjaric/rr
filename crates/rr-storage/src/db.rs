@@ -128,7 +128,9 @@ pub(crate) struct UnendedSession {
 }
 
 /// Handle to the operational `SQLite` database; see the module docs for
-/// connection and encoding invariants.
+/// connection and encoding invariants. Cloning is cheap: clones share the
+/// underlying connection pool.
+#[derive(Clone)]
 pub struct Db {
     pool: SqlitePool,
 }
