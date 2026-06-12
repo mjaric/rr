@@ -46,6 +46,11 @@ pub struct ArchiveSenders {
 /// exchange timestamp skew before a quiet window is finalized.
 const FLUSH_LAG: TimeDelta = TimeDelta::seconds(5);
 
+/// How often the ingest loop logs a heartbeat. Individual trades are not
+/// logged (it would be thousands of lines a minute), so this is the operator's
+/// live signal that data is flowing.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Builds the real four-pair public-trade stream ([`PAIRS`]) and merges all
 /// exchanges into one stream. Network-bound: covered by the live smoke test,
 /// not unit tests.
@@ -130,6 +135,13 @@ where
     }
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // First heartbeat fires after one full interval, not immediately, so it
+    // reports real counts rather than zeros at startup.
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
+        HEARTBEAT_INTERVAL,
+    );
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             event = stream.next() => match event {
@@ -143,6 +155,7 @@ where
                 }
             },
             _ = interval.tick() => state.flush(Utc::now() - FLUSH_LAG).await?,
+            _ = heartbeat.tick() => state.heartbeat(),
             // Any signal (or a dropped sender) means shut down cleanly.
             _ = shutdown.changed() => break,
         }
@@ -160,6 +173,13 @@ struct Supervisor {
     /// Exchanges that emitted `Reconnecting` and have not yet delivered a
     /// successful item; the next item closes the disconnected interval.
     reconnecting: BTreeSet<String>,
+    /// Trades archived and candles emitted since the run began; reported by
+    /// [`Supervisor::heartbeat`] with the most recent trade for liveness.
+    trades_total: u64,
+    candles_total: u64,
+    trades_at_last_heartbeat: u64,
+    candles_at_last_heartbeat: u64,
+    last_trade: Option<String>,
 }
 
 impl Supervisor {
@@ -171,7 +191,28 @@ impl Supervisor {
             agg: CandleAggregator::default(),
             gap: GapDetector::default(),
             reconnecting: BTreeSet::new(),
+            trades_total: 0,
+            candles_total: 0,
+            trades_at_last_heartbeat: 0,
+            candles_at_last_heartbeat: 0,
+            last_trade: None,
         }
+    }
+
+    /// Logs ingest progress at `INFO` so an operator sees data flowing without
+    /// per-trade spam. Always logged, so a `0` since-last count is itself the
+    /// signal that nothing is arriving.
+    fn heartbeat(&mut self) {
+        tracing::info!(
+            trades_total = self.trades_total,
+            candles_total = self.candles_total,
+            trades_since_last = self.trades_total - self.trades_at_last_heartbeat,
+            candles_since_last = self.candles_total - self.candles_at_last_heartbeat,
+            last_trade = self.last_trade.as_deref().unwrap_or("none"),
+            "ingest heartbeat"
+        );
+        self.trades_at_last_heartbeat = self.trades_total;
+        self.candles_at_last_heartbeat = self.candles_total;
     }
 
     /// Persists one stream event now; any failure is fatal.
@@ -252,6 +293,8 @@ impl Supervisor {
         if self.senders.trades.send(record.clone()).await.is_err() {
             return Err(EngineError::ArchiveChannelClosed { dataset: "trades" });
         }
+        self.trades_total += 1;
+        self.last_trade = Some(format!("{}@{}", record.pair, record.price));
         let (candles, outcome) = self.agg.ingest(&record);
         self.send_candles(candles).await?;
         if outcome == IngestOutcome::Late {
@@ -355,11 +398,12 @@ impl Supervisor {
         self.send_candles(candles).await
     }
 
-    async fn send_candles(&self, candles: Vec<CandleRecord>) -> Result<(), EngineError> {
+    async fn send_candles(&mut self, candles: Vec<CandleRecord>) -> Result<(), EngineError> {
         for candle in candles {
             if self.senders.candles.send(candle).await.is_err() {
                 return Err(EngineError::ArchiveChannelClosed { dataset: "candles" });
             }
+            self.candles_total += 1;
         }
         Ok(())
     }
