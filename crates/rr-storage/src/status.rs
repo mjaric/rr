@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 
 use ::parquet::arrow::ProjectionMask;
 use ::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use arrow::array::TimestampMillisecondArray;
+use arrow::array::{Array, TimestampMillisecondArray};
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeDelta, Utc};
 
 use crate::db::{ArchiveFileRow, Db, EventKind, StreamEvent, UnendedSession};
@@ -380,7 +380,17 @@ fn read_ts_open_into(
                     path.display()
                 ))
             })?;
-        for &ms in column.values() {
+        // The writer declares ts_open non-nullable, so null slots mean a
+        // damaged or foreign file — skip them instead of reading the
+        // zero-filled value buffer underneath.
+        if column.null_count() != 0 {
+            tracing::warn!(
+                file = %path.display(),
+                nulls = column.null_count(),
+                "null ts_open slots in candle file; skipped — coverage may undercount"
+            );
+        }
+        for ms in column.iter().flatten() {
             let Some(ts) = DateTime::from_timestamp_millis(ms) else {
                 tracing::warn!(
                     file = %path.display(),
@@ -1047,6 +1057,71 @@ mod tests {
                 late_events: 0,
             }]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        reason = "test assertions; Result is for `?`"
+    )]
+    async fn damaged_parquet_file_fails_the_report() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let db = open_db(&tmp).await?;
+        let dir =
+            partition::partition_dir(tmp.path(), "candles", "binance_spot", "BTC-USDT", day());
+        std::fs::create_dir_all(&dir)?;
+        // Correctly named but not parquet: never quarantined (only the
+        // writer quarantines on open), so reading it must surface an error.
+        std::fs::write(dir.join("part-0000.parquet"), b"junk junk junk junk")?;
+
+        match archive_status_at(tmp.path(), &db, day(), day_end()).await {
+            Err(StorageError::Parquet(_)) => {}
+            other => panic!("expected StorageError::Parquet, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "test assertions; Result is for `?`"
+    )]
+    async fn null_ts_open_slots_are_skipped_not_read_as_garbage() -> TestResult {
+        use std::sync::Arc;
+
+        use ::parquet::arrow::ArrowWriter;
+        use arrow::array::{RecordBatch, TimestampMillisecondArray};
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+        // The parquet reader zero-fills the value slots of an all-null
+        // column, and zero milliseconds is 1970-01-01T00:00Z — report on
+        // that day so a reader ignoring the null bitmap would count a null
+        // slot as a present minute.
+        let epoch_day: NaiveDate = "1970-01-01".parse()?;
+        let tmp = tempfile::tempdir()?;
+        let db = open_db(&tmp).await?;
+        let dir =
+            partition::partition_dir(tmp.path(), "candles", "binance_spot", "BTC-USDT", epoch_day);
+        std::fs::create_dir_all(&dir)?;
+
+        let ts_open = TimestampMillisecondArray::from(vec![None, None]).with_timezone("UTC");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts_open",
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ts_open)])?;
+        let file = std::fs::File::create(dir.join("part-0000.parquet"))?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+
+        let report =
+            archive_status_at(tmp.path(), &db, epoch_day, ts("1970-01-02T00:00:00Z")).await?;
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].minutes_present, 0);
         Ok(())
     }
 }
