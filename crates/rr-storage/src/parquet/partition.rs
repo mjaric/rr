@@ -58,6 +58,10 @@ pub fn next_part_number(dir: &Path) -> Result<u32, StorageError> {
         })?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
+            tracing::warn!(
+                file = %entry.path().display(),
+                "skipping non-UTF-8 file name in partition directory"
+            );
             continue;
         };
         let Some(part) = parse_part_number(name) else {

@@ -6,14 +6,22 @@
 //! Files roll — footer closed, part number incremented — when an open file's
 //! age exceeds the roll interval or a record arrives for the same
 //! (exchange, pair) on a different date, so a crash loses at most one
-//! unclosed file. On (re)opening a partition directory, footer-less leftovers
-//! are quarantined as `*.corrupt` and part numbering continues past every
-//! existing part, quarantined or not.
+//! unclosed file per open partition. On (re)opening a partition directory,
+//! footer-less leftovers are quarantined as `*.corrupt` and part numbering
+//! continues past every existing part, quarantined or not.
 //!
 //! The writer is synchronous (`std::fs`; it runs on a dedicated thread) and
 //! holds no clock: callers supply `now` to [`PartitionedWriter::append`] and
 //! [`PartitionedWriter::roll_due`]. Rows are buffered and flushed to the open
-//! file as a row group every [`FLUSH_THRESHOLD`] appends and on roll/finalize.
+//! file as a row group every [`FLUSH_THRESHOLD`] appends and on roll/finalize;
+//! finalize fsyncs before reporting, so a [`FinalizedFile`] is durable when
+//! returned.
+//!
+//! Error handling: when a call that finalizes several files fails partway,
+//! files already closed in that call are not returned, so their
+//! `archive_files` registration is lost. The caller treats any writer error
+//! as fatal (clean shutdown, exit nonzero); reconciling unregistered part
+//! files via a startup rescan is future work.
 
 pub mod encode;
 pub mod partition;
@@ -84,15 +92,21 @@ impl<D: Dataset> PartitionedWriter<D> {
     /// (aged out, or same (exchange, pair) but a different date than the
     /// record). Returns the files finalized by those rolls.
     ///
+    /// The record is validated up front, before any roll or file creation,
+    /// so an unencodable record fails its own append with no side effects —
+    /// it never poisons a buffered batch.
+    ///
     /// # Errors
     ///
     /// Returns [`StorageError`] on filesystem failures, encoding failures,
-    /// or decimals that do not fit `Decimal128(38, 18)`.
+    /// or decimals the archive cannot represent. On error, files already
+    /// finalized within this call are dropped unreported (see module docs).
     pub fn append(
         &mut self,
         record: D::Record,
         now: DateTime<Utc>,
     ) -> Result<Vec<FinalizedFile>, StorageError> {
+        D::validate(&record)?;
         let mut finalized = self.roll_due(now)?;
         let key: PartitionKey = (
             D::exchange(&record).to_owned(),
@@ -124,7 +138,9 @@ impl<D: Dataset> PartitionedWriter<D> {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError`] if flushing or closing a file fails.
+    /// Returns [`StorageError`] if flushing or closing a file fails. On
+    /// error, files already finalized within this call are dropped
+    /// unreported (see module docs).
     pub fn roll_due(&mut self, now: DateTime<Utc>) -> Result<Vec<FinalizedFile>, StorageError> {
         let due: Vec<PartitionKey> = self
             .open
@@ -140,7 +156,9 @@ impl<D: Dataset> PartitionedWriter<D> {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError`] if flushing or closing a file fails.
+    /// Returns [`StorageError`] if flushing or closing a file fails. On
+    /// error, files already finalized within this call are dropped
+    /// unreported (see module docs).
     pub fn finalize_all(&mut self) -> Result<Vec<FinalizedFile>, StorageError> {
         let open = std::mem::take(&mut self.open);
         let mut finalized = Vec::with_capacity(open.len());
@@ -150,6 +168,8 @@ impl<D: Dataset> PartitionedWriter<D> {
         Ok(finalized)
     }
 
+    /// Finalizes the open files of `keys`. On error, files already
+    /// finalized within this call are dropped unreported (see module docs).
     fn finalize_keys(
         &mut self,
         keys: Vec<PartitionKey>,
@@ -232,9 +252,14 @@ impl<D: Dataset> OpenFile<D> {
         Ok(())
     }
 
+    /// Flushes, writes the footer, and fsyncs before reporting: a
+    /// [`FinalizedFile`] handed to the caller (and registered in
+    /// `archive_files`) must survive power loss, not just process death.
     fn finalize(mut self, key: &PartitionKey) -> Result<FinalizedFile, StorageError> {
         self.flush()?;
-        self.writer.close()?;
+        let file = self.writer.into_inner()?;
+        file.sync_all()
+            .map_err(|source| io_error(&self.path, source))?;
         Ok(FinalizedFile {
             dataset: D::NAME,
             exchange: key.0.clone(),
@@ -256,6 +281,10 @@ fn quarantine_footerless(dir: &Path) -> Result<(), StorageError> {
         let entry = entry.map_err(|source| io_error(dir, source))?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
+            tracing::warn!(
+                file = %entry.path().display(),
+                "skipping non-UTF-8 file name in partition directory"
+            );
             continue;
         };
         if !name.ends_with(".parquet") {
@@ -530,6 +559,8 @@ mod tests {
         writer.append(trade("BTC-USDT", "2026-06-11T09:59:58Z", "1")?, opened)?;
         // 14 minutes: not due yet (roll is strictly greater than the interval).
         assert!(writer.roll_due(opened + TimeDelta::minutes(14))?.is_empty());
+        // Exactly the roll interval: still not due (strict `>`).
+        assert!(writer.roll_due(opened + ROLL)?.is_empty());
 
         let later = opened + TimeDelta::minutes(16);
         let rolled = writer.append(trade("BTC-USDT", "2026-06-11T10:15:30Z", "2")?, later)?;
@@ -540,6 +571,40 @@ mod tests {
         let finalized = writer.finalize_all()?;
         assert_eq!(finalized.len(), 1);
         assert!(finalized[0].path.ends_with("part-0001.parquet"));
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        reason = "test assertions; Result is for `?`"
+    )]
+    fn unencodable_record_fails_its_own_append_only() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let now = "2026-06-11T10:00:00Z".parse::<DateTime<Utc>>()?;
+        let mut writer = PartitionedWriter::<TradesDataset>::new(tmp.path(), ROLL);
+
+        writer.append(trade("BTC-USDT", "2026-06-11T09:59:58Z", "1")?, now)?;
+
+        // 19 fractional digits: must fail this append at validation time,
+        // before touching the open file or its buffer.
+        let mut bad = trade("BTC-USDT", "2026-06-11T09:59:59Z", "2")?;
+        bad.price = "0.0000000000000000001".parse::<Decimal>()?;
+        match writer.append(bad, now) {
+            Err(crate::error::StorageError::DecimalPrecision { scale, .. }) => {
+                assert_eq!(scale, 19);
+            }
+            other => panic!("expected DecimalPrecision, got {other:?}"),
+        }
+
+        // The previously appended good row is unaffected and reads back.
+        let finalized = writer.finalize_all()?;
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(finalized[0].rows, 1);
+        let read_back = read_trades(&finalized[0])?;
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(read_back[0].trade_id, "1");
         Ok(())
     }
 

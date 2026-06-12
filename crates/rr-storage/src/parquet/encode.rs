@@ -23,8 +23,12 @@ pub const DECIMAL_PRECISION: u8 = 38;
 /// Scale of every decimal column in the archive.
 pub const DECIMAL_SCALE: i8 = 18;
 
-/// Largest magnitude representable in `Decimal128(38, 18)`: 38 nines.
-const MAX_ABS_DECIMAL128: i128 = 99_999_999_999_999_999_999_999_999_999_999_999_999;
+/// Largest scaled magnitude the archive accepts: `Decimal::MAX.mantissa()`
+/// (`rust_decimal`'s 96-bit mantissa limit), not the wider `Decimal128(38, 18)`
+/// bound — encode must error exactly when read-back into `Decimal` would
+/// fail, keeping the round trip symmetric. Guarded by a test against
+/// `Decimal::MAX.mantissa()`.
+const MAX_ABS_DECIMAL128: i128 = 79_228_162_514_264_337_593_543_950_335;
 
 /// Converts a decimal to the `Decimal128(38, 18)` wire integer.
 ///
@@ -33,7 +37,7 @@ const MAX_ABS_DECIMAL128: i128 = 99_999_999_999_999_999_999_999_999_999_999_999_
 /// - [`StorageError::DecimalPrecision`] if `value` has more than 18
 ///   fractional digits after normalization — the archive never rounds.
 /// - [`StorageError::DecimalOverflow`] if the scaled magnitude exceeds
-///   38 digits.
+///   what a `Decimal` can read back losslessly ([`MAX_ABS_DECIMAL128`]).
 pub fn decimal_to_i128_scale18(value: Decimal) -> Result<i128, StorageError> {
     const SCALE: u32 = 18;
     let normalized = value.normalize();
@@ -68,6 +72,16 @@ pub trait Dataset {
     /// Returns [`StorageError`] if a decimal cannot be represented in
     /// `Decimal128(38, 18)` or batch construction fails.
     fn encode(records: &[Self::Record]) -> Result<RecordBatch, StorageError>;
+    /// Checks that every decimal field of `record` can be encoded
+    /// losslessly. The writer calls this per append so a bad record fails
+    /// its own append instead of poisoning a buffered batch at flush time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::DecimalPrecision`] or
+    /// [`StorageError::DecimalOverflow`] for a decimal that does not fit
+    /// the archive representation.
+    fn validate(record: &Self::Record) -> Result<(), StorageError>;
     /// Exchange partition component.
     fn exchange(record: &Self::Record) -> &str;
     /// Pair partition component.
@@ -113,6 +127,12 @@ impl Dataset for TradesDataset {
             )),
         ];
         Ok(RecordBatch::try_new(Self::schema(), columns)?)
+    }
+
+    fn validate(record: &TradeRecord) -> Result<(), StorageError> {
+        decimal_to_i128_scale18(record.price)?;
+        decimal_to_i128_scale18(record.amount)?;
+        Ok(())
     }
 
     fn exchange(record: &TradeRecord) -> &str {
@@ -161,6 +181,19 @@ impl Dataset for CandlesDataset {
             )),
         ];
         Ok(RecordBatch::try_new(Self::schema(), columns)?)
+    }
+
+    fn validate(record: &CandleRecord) -> Result<(), StorageError> {
+        for value in [
+            record.open,
+            record.high,
+            record.low,
+            record.close,
+            record.volume,
+        ] {
+            decimal_to_i128_scale18(value)?;
+        }
+        Ok(())
     }
 
     fn exchange(record: &CandleRecord) -> &str {
@@ -221,8 +254,8 @@ mod tests {
 
     use crate::error::StorageError;
     use crate::parquet::encode::{
-        CandlesDataset, DECIMAL_PRECISION, DECIMAL_SCALE, Dataset, TradesDataset,
-        decimal_to_i128_scale18,
+        CandlesDataset, DECIMAL_PRECISION, DECIMAL_SCALE, Dataset, MAX_ABS_DECIMAL128,
+        TradesDataset, decimal_to_i128_scale18,
     };
     use crate::records::{CandleRecord, Side, TradeRecord};
 
@@ -319,7 +352,8 @@ mod tests {
     )]
     fn decimal_too_large_for_decimal128_errors() -> TestResult {
         // 2e20 × 10^18 overflows i128; 1.6e20 × 10^18 fits i128 but exceeds
-        // the 38-digit precision of Decimal128(38, 18). Both must error.
+        // rust_decimal's mantissa bound, so it could never read back. Both
+        // must error.
         for raw in ["200000000000000000000", "160000000000000000000"] {
             let value = raw.parse::<Decimal>()?;
             match decimal_to_i128_scale18(value) {
@@ -328,6 +362,35 @@ mod tests {
                 }
                 other => panic!("expected DecimalOverflow for {raw}, got {other:?}"),
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn decimal_overflow_bound_is_decimal_max_mantissa() {
+        assert_eq!(MAX_ABS_DECIMAL128, Decimal::MAX.mantissa());
+    }
+
+    #[test]
+    #[expect(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        reason = "test assertions; Result is for `?`"
+    )]
+    fn decimal_overflow_boundary_discriminates_read_back_failures() -> TestResult {
+        // Exactly Decimal::MAX.mantissa() at scale 18: encodes and reads back.
+        let largest = "79228162514.264337593543950335".parse::<Decimal>()?;
+        let scaled = decimal_to_i128_scale18(largest)?;
+        assert_eq!(scaled, Decimal::MAX.mantissa());
+        assert_eq!(Decimal::try_from_i128_with_scale(scaled, 18)?, largest);
+
+        // One step above (17 fractional digits, so the value itself is a
+        // valid Decimal): the scaled magnitude exceeds what a Decimal can
+        // read back, even though Decimal128(38, 18) could store it.
+        let too_large = "79228162514.26433759354395034".parse::<Decimal>()?;
+        match decimal_to_i128_scale18(too_large) {
+            Err(StorageError::DecimalOverflow { value }) => assert_eq!(value, too_large),
+            other => panic!("expected DecimalOverflow, got {other:?}"),
         }
         Ok(())
     }
