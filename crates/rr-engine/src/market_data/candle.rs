@@ -408,4 +408,57 @@ mod tests {
         assert_eq!(candles[1].ts_open.to_rfc3339(), "2026-06-12T10:00:00+00:00");
         assert_eq!(candles[2].ts_open.to_rfc3339(), "2026-06-12T10:01:00+00:00");
     }
+
+    mod props {
+        use chrono::TimeDelta;
+        use proptest::prelude::{prop, prop_assert, prop_assert_eq, proptest};
+        use rust_decimal::Decimal;
+
+        use crate::market_data::candle::tests::ts;
+        use crate::market_data::candle::{CandleAggregator, IngestOutcome};
+        use rr_storage::records::{Side, TradeRecord};
+
+        proptest! {
+            #[test]
+            fn single_minute_candle_matches_its_trades(
+                raw in prop::collection::vec(
+                    (1i64..1_000_000_000, 1i64..1_000_000_000, 0i64..60_000),
+                    1..50,
+                )
+            ) {
+                let base = ts("2026-06-12T10:00:00Z");
+                let trades: Vec<TradeRecord> = raw
+                    .iter()
+                    .map(|&(price, amount, offset_ms)| TradeRecord {
+                        exchange: "binance_spot".to_owned(),
+                        pair: "BTC-USDT".to_owned(),
+                        ts_exchange: base + TimeDelta::milliseconds(offset_ms),
+                        ts_received: base + TimeDelta::milliseconds(offset_ms),
+                        price: Decimal::new(price, 4),
+                        amount: Decimal::new(amount, 6),
+                        side: Side::Buy,
+                        trade_id: "t".to_owned(),
+                    })
+                    .collect();
+
+                let mut agg = CandleAggregator::default();
+                for t in &trades {
+                    let (emitted, outcome) = agg.ingest(t);
+                    prop_assert!(emitted.is_empty());
+                    prop_assert_eq!(outcome, IngestOutcome::Ok);
+                }
+
+                let candles = agg.flush_all();
+                prop_assert_eq!(candles.len(), 1);
+                let c = &candles[0];
+                prop_assert_eq!(c.ts_open, base);
+                prop_assert_eq!(Some(c.open), trades.first().map(|t| t.price));
+                prop_assert_eq!(Some(c.close), trades.last().map(|t| t.price));
+                prop_assert_eq!(Some(c.high), trades.iter().map(|t| t.price).max());
+                prop_assert_eq!(Some(c.low), trades.iter().map(|t| t.price).min());
+                prop_assert_eq!(c.volume, trades.iter().map(|t| t.amount).sum::<Decimal>());
+                prop_assert_eq!(usize::try_from(c.trade_count).ok(), Some(trades.len()));
+            }
+        }
+    }
 }
