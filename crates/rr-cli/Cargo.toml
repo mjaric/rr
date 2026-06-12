@@ -1,0 +1,18 @@
+[package]
+name = "rr-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rr"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+
+[lints]
+workspace = true
