@@ -45,6 +45,7 @@ designed, planned, and implemented one at a time — see the roadmap below.
 
 ## Documentation
 
+- [Usage](docs/usage.md) — running `rr stream` and reading `rr archive-status`
 - [System architecture](docs/architecture.md) — the current system model (kept up to date)
 - [Design & master plan](docs/plans/2026-06-12-trading-intelligence-design.md) — approved foundation design
 - `docs/plans/` — per-milestone design and implementation plan documents
@@ -65,6 +66,19 @@ prek auto-update --cooldown-days 7   # keep hook versions fresh, 7-day cooldown
 cargo build --workspace       # Rust workspace
 cd analytics && uv sync       # Python analytics environment
 ```
+
+## Usage
+
+Record market data and check coverage (full guide in [docs/usage.md](docs/usage.md)):
+
+```sh
+rr stream --data-dir ./data                  # record live trades + candles (Ctrl-C to stop)
+rr archive-status --date YYYY-MM-DD           # per-pair candle-minute coverage report
+```
+
+`rr stream` logs an ingest heartbeat every 30 s (trade/candle counts) so you can see
+data flowing without per-trade spam; `archive-status` reports `present/expected`
+minutes per pair, distinguishing quiet markets from real connection gaps.
 
 ## Disclaimer
 
