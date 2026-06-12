@@ -9,6 +9,7 @@ current (intended) state.
 ```
 rr/
 ├── crates/
+│   ├── rr-cli         # the `rr` binary: CLI entry point for all engine commands
 │   ├── rr-engine      # barter-rs integration: strategies, risk manager, mode runner
 │   ├── rr-kraken      # Kraken connector implementing barter-data's Connector trait
 │   ├── rr-storage     # SQLite (operational state) + Parquet (market-data history)
@@ -20,6 +21,7 @@ rr/
 
 | Component | Responsibility | Key dependency |
 |-----------|----------------|----------------|
+| rr-cli | The `rr` binary: command-line entry point (stream, archive-status, …) | clap |
 | rr-engine | Event loop, strategies, risk enforcement, execution routing | barter-rs |
 | rr-kraken | Kraken WebSocket market data, normalized to barter-data model | barter-data |
 | rr-storage | Persistence: SQLite schema, Parquet archiver, run tracking | sqlx, parquet |

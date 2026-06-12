@@ -38,8 +38,9 @@ implemented change makes it stale.
 
 ## Repository conventions
 
-- Cargo workspace under `crates/`: `rr-engine`, `rr-kraken`, `rr-storage`,
-  `rr-server`, `rr-dashboard`. Python analytics under `analytics/` (uv/ruff/ty).
+- Cargo workspace under `crates/`: `rr-cli` (the `rr` binary), `rr-engine`,
+  `rr-kraken`, `rr-storage`, `rr-server`, `rr-dashboard`. Python analytics under
+  `analytics/` (uv/ruff/ty).
 - Storage: SQLite via sqlx (WAL) for operational state; Parquet for market-data
   history (partitioned by exchange/pair/day). Keep SQL portable — Postgres is the
   upgrade path.
@@ -49,6 +50,10 @@ implemented change makes it stale.
   exception is the CDN-loaded `lightweight-charts` library.
 - Rust style, lints, and quality gates follow the global standards (clippy pedantic
   + deny unwrap/panic/todo, zero warnings, `prek run` before commit).
+- Lints stay strict everywhere, tests included. A test that must panic/unwrap/expect
+  carries a narrow `#[expect(lint, reason = "...")]` on the test fn — never `#[allow]`.
+- `rr-kraken` depends only on barter-data, never on other `rr-*` crates — it is
+  planned for separate open-sourcing.
 
 ## Domain guardrails for agents
 
