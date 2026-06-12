@@ -46,10 +46,31 @@ use crate::db::Db;
 use crate::error::StorageError;
 use crate::parquet::encode::{CandlesDataset, Dataset, TradesDataset};
 use crate::parquet::{FinalizedFile, PartitionedWriter};
+use crate::records::{CandleRecord, TradeRecord};
 
 /// How long a worker waits for a record before falling back to a `roll_due`
 /// tick, so idle partitions still roll without their next record.
 const RECV_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Shared configuration for the archive writer threads. Bundled so [`spawn`]
+/// and [`run_archiver`] stay within the positional-parameter limit; the
+/// per-dataset receivers are the only non-shared inputs.
+#[derive(Clone)]
+pub struct ArchiveConfig {
+    /// Archive root; each [`PartitionedWriter`] is created under it.
+    pub data_dir: PathBuf,
+    /// How long an open part file may live before it rolls.
+    pub roll_interval: TimeDelta,
+    /// Operational database; finalized files are registered here.
+    pub db: Db,
+    /// Session every registered file is attributed to.
+    pub session_id: i64,
+    /// Runtime the blocking threads drive `recv`, timers, and DB calls on.
+    pub handle: Handle,
+    /// Global shutdown watch; a dying worker sends `true` so the supervisor
+    /// drops both archive senders.
+    pub shutdown: watch::Sender<bool>,
+}
 
 /// Join handles for the two archive writer threads (one per dataset).
 pub struct ArchiveHandles {
@@ -93,102 +114,71 @@ fn join_one(
 
 /// Spawns both archive writer threads and returns their join handles.
 ///
-/// `data_dir` and `roll_interval` configure each [`PartitionedWriter`]; `db`
-/// and `session_id` register finalized files; `handle` is the runtime the
-/// blocking threads drive their `recv`, timer, and database calls against
-/// (the CLI passes [`Handle::current`] from its multi-thread runtime).
-/// `shutdown` is the global shutdown watch: a worker that hits a fatal error
-/// sends `true` on it so the supervisor drops both senders.
+/// `config` carries the shared writer/database/runtime settings; the two
+/// receivers are the per-dataset inputs the supervisor feeds. The CLI builds
+/// `config.handle` from [`Handle::current`] on its multi-thread runtime, and
+/// `config.shutdown` is the global watch a dying worker signals so the
+/// supervisor drops both senders.
 ///
 /// Callers MUST [`ArchiveHandles::join`] before dropping the runtime: the
-/// workers `block_on` `handle`, and a runtime dropped mid-`block_on` panics.
+/// workers `block_on` `config.handle`, and a runtime dropped mid-`block_on`
+/// panics.
 #[must_use]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the binding design contract fixes this spawner's parameters; each \
-              is distinct and required (two channels, runtime handle, shutdown)"
-)]
 pub fn spawn(
-    data_dir: PathBuf,
-    roll_interval: TimeDelta,
-    db: Db,
-    session_id: i64,
-    trades_rx: Receiver<<TradesDataset as Dataset>::Record>,
-    candles_rx: Receiver<<CandlesDataset as Dataset>::Record>,
-    handle: Handle,
-    shutdown: watch::Sender<bool>,
+    config: ArchiveConfig,
+    trades_rx: Receiver<TradeRecord>,
+    candles_rx: Receiver<CandleRecord>,
 ) -> ArchiveHandles {
-    let trades = spawn_one::<TradesDataset>(
-        data_dir.clone(),
-        roll_interval,
-        db.clone(),
-        session_id,
-        trades_rx,
-        handle.clone(),
-        shutdown.clone(),
-    );
-    let candles = spawn_one::<CandlesDataset>(
-        data_dir,
-        roll_interval,
-        db,
-        session_id,
-        candles_rx,
-        handle,
-        shutdown,
-    );
+    let trades = spawn_one::<TradesDataset>(config.clone(), trades_rx);
+    let candles = spawn_one::<CandlesDataset>(config, candles_rx);
     ArchiveHandles { trades, candles }
 }
 
 /// Spawns one dataset's writer thread.
 fn spawn_one<D: Dataset>(
-    data_dir: PathBuf,
-    roll_interval: TimeDelta,
-    db: Db,
-    session_id: i64,
+    config: ArchiveConfig,
     rx: Receiver<D::Record>,
-    handle: Handle,
-    shutdown: watch::Sender<bool>,
 ) -> JoinHandle<Result<(), StorageError>>
 where
     D::Record: Send + 'static,
 {
     std::thread::spawn(move || {
-        let writer = PartitionedWriter::<D>::new(data_dir, roll_interval);
-        run_archiver::<D>(writer, rx, db, session_id, handle, shutdown)
+        let writer = PartitionedWriter::<D>::new(config.data_dir.clone(), config.roll_interval);
+        run_archiver::<D>(writer, rx, config)
     })
 }
 
-/// Drains `rx` into `writer`, registering every finalized file in `db`.
+/// Drains `rx` into the writer, registering every finalized file in the
+/// database.
 ///
-/// Runs on a dedicated OS thread. Blocks on `handle` for the timed `recv`
-/// and for each `record_file` call. Returns `Ok(())` once the channel closes
-/// and `finalize_all` has flushed; any writer or database error returns
-/// `Err` (fatal) after logging the failing dataset and signalling `shutdown`
-/// so the supervisor drops both senders (closing the quiet-market hang).
+/// Runs on a dedicated OS thread. Blocks on `config.handle` for the timed
+/// `recv` and for each `record_file` call. Returns `Ok(())` once the channel
+/// closes and `finalize_all` has flushed; any writer or database error
+/// returns `Err` (fatal) after logging the failing dataset and signalling
+/// `config.shutdown` so the supervisor drops both senders (closing the
+/// quiet-market hang).
 ///
 /// Callers MUST [`ArchiveHandles::join`] before dropping the runtime: this
-/// `block_on`s `handle`, and a runtime dropped mid-`block_on` panics.
+/// `block_on`s `config.handle`, and a runtime dropped mid-`block_on` panics.
 ///
 /// # Errors
 ///
 /// Returns [`StorageError`] on the first writer or database failure.
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "thread entry point: it should own its resources for the thread's \
-              lifetime; ownership is the right semantic though the body only \
-              borrows, and Db/Handle are cheap (Arc-backed) to move"
-)]
 pub fn run_archiver<D: Dataset>(
     writer: PartitionedWriter<D>,
     rx: Receiver<D::Record>,
-    db: Db,
-    session_id: i64,
-    handle: Handle,
-    shutdown: watch::Sender<bool>,
+    config: ArchiveConfig,
 ) -> Result<(), StorageError>
 where
     D::Record: Send + 'static,
 {
+    let ArchiveConfig {
+        db,
+        session_id,
+        handle,
+        shutdown,
+        ..
+    } = config;
     let result = drive::<D>(writer, rx, &db, session_id, &handle);
     if result.is_err() {
         // Wake the supervisor so it drops both senders; otherwise the sibling
@@ -262,7 +252,7 @@ mod tests {
     use tokio::runtime::Handle;
     use tokio::sync::{mpsc, watch};
 
-    use crate::archive_task::spawn;
+    use crate::archive_task::{ArchiveConfig, spawn};
     use crate::db::Db;
     use crate::records::{CandleRecord, Side, TradeRecord};
 
@@ -270,6 +260,23 @@ mod tests {
 
     const ROLL: TimeDelta = TimeDelta::minutes(15);
     const PARTITION_DATE: &str = "2026-06-11";
+
+    fn config(
+        dir: &tempfile::TempDir,
+        roll_interval: TimeDelta,
+        db: Db,
+        session_id: i64,
+        shutdown: watch::Sender<bool>,
+    ) -> ArchiveConfig {
+        ArchiveConfig {
+            data_dir: dir.path().to_path_buf(),
+            roll_interval,
+            db,
+            session_id,
+            handle: Handle::current(),
+            shutdown,
+        }
+    }
 
     fn trade(id: &str) -> Result<TradeRecord, Box<dyn Error>> {
         Ok(TradeRecord {
@@ -317,14 +324,9 @@ mod tests {
         let (candles_tx, candles_rx) = mpsc::channel(16);
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let handles = spawn(
-            tmp.path().to_path_buf(),
-            ROLL,
-            db.clone(),
-            session,
+            config(&tmp, ROLL, db.clone(), session, shutdown_tx),
             trades_rx,
             candles_rx,
-            Handle::current(),
-            shutdown_tx,
         );
 
         for id in 0..10 {
@@ -379,14 +381,9 @@ mod tests {
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         // Zero roll interval: any open file is due on the first timeout tick.
         let handles = spawn(
-            tmp.path().to_path_buf(),
-            TimeDelta::zero(),
-            db.clone(),
-            session,
+            config(&tmp, TimeDelta::zero(), db.clone(), session, shutdown_tx),
             trades_rx,
             candles_rx,
-            Handle::current(),
-            shutdown_tx,
         );
 
         trades_tx.send(trade("1")?).await?;
@@ -418,14 +415,9 @@ mod tests {
         let (candles_tx, candles_rx) = mpsc::channel(16);
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let handles = spawn(
-            tmp.path().to_path_buf(),
-            ROLL,
-            db.clone(),
-            session,
+            config(&tmp, ROLL, db.clone(), session, shutdown_tx),
             trades_rx,
             candles_rx,
-            Handle::current(),
-            shutdown_tx,
         );
 
         // 19 fractional digits: rejected by TradesDataset::validate at append.
@@ -462,14 +454,9 @@ mod tests {
         let (candles_tx, candles_rx) = mpsc::channel(16);
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let handles = spawn(
-            tmp.path().to_path_buf(),
-            ROLL,
-            db.clone(),
-            session,
+            config(&tmp, ROLL, db.clone(), session, shutdown_tx),
             trades_rx,
             candles_rx,
-            Handle::current(),
-            shutdown_tx,
         );
 
         let mut bad = trade("1")?;
